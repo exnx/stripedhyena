@@ -12,10 +12,163 @@ from src.engine import HyenaInferenceEngine
 from src.layers import ParallelGatedMLP, RMSNorm, VocabParallelEmbedding
 from src.utils import column_split, print_rank_0
 
+from src.positional_embeddings import LinearlyScaledRotaryEmbedding
+
+from src.flash_attention import FlashSelfAttention
+from src.utils import exists
+
+from src.positional_embeddings import (
+    LinearlyScaledRotaryEmbedding,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_torch,
+)
+
+
 try:
     from flash_attn.modules.mha import MHA
 except ImportError:
     "flash_attn not installed"
+
+
+class CustomSelfAttention(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+        self.dtype = config.get("attn_block_dtype", torch.bfloat16)
+        self.mlp_dtype = config.get("mlp_dtype", torch.bfloat16)
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size_per_attention_head = config.hidden_size // config.num_attention_heads
+        self.use_cache = config.get("use_cache", False)
+    
+        self.rotary_emb = LinearlyScaledRotaryEmbedding(
+            self.hidden_size // config.num_attention_heads,  # rotary dim
+            scaling_factor=config.get("rotary_emb_scaling_factor", 1.0),
+            base=config.get("rotary_emb_base", 10000),
+            precision=self.mlp_dtype,
+        )
+        
+        # need projection layer
+        self.Wqkv = nn.Linear(self.hidden_size, 3 * self.hidden_size)  # includes bias
+        
+        # need attention layer
+        # what about norm_factor?
+        self.inner_mha_cls = FlashSelfAttention(causal=True)
+        
+        # output layer
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
+
+    def forward(self, u, inference_params=None, padding_mask=None):
+        
+        # swap 0 and 1 dims, to make consistent with savanna code
+        u = u.permute(1, 0, 2)
+        
+        mixed_u_layer = self.Wqkv(u)  # [4, 1, 3072]
+        
+        # split projections along last channel dim
+        query, key, value = mixed_u_layer.split(self.hidden_size, dim=-1)  # each, [4, 1, 1024]
+    
+        query_rot, key_rot = query, key
+    
+        apply_rotary_fn = (
+            apply_rotary_pos_emb_torch if self.dtype == torch.bfloat16 else apply_rotary_pos_emb
+        )
+
+        seq_len = key.shape[0]
+        
+        cos, sin = self.rotary_emb(value, seq_len=seq_len)
+        offset = 0
+        
+        query, key = apply_rotary_fn(
+            query_rot, key_rot, cos, sin, offset=offset
+        )
+
+        # ==================================
+        # Cache key and value for inference
+        # ==================================
+        
+        if self.use_cache:
+            present = torch.stack((key, value))
+
+        breakpoint()
+        
+        output_size = (
+            query.size(1),
+            query.size(2),
+            query.size(0),
+            key.size(0),
+        )            
+        
+        # [sk, b, np, hn] -> [b, sk, np, hn] -> [b * sk, 1, np, hn]
+        key = key.transpose(0, 1).reshape(
+            output_size[0] * output_size[3], 1, output_size[1], -1
+        )
+        value = value.transpose(0, 1).reshape(
+            output_size[0] * output_size[3], 1, output_size[1], -1
+        )
+
+        batch_size = output_size[0]
+        max_seqlen_q = output_size[2]
+        max_seqlen_k = output_size[3]
+
+        cu_seqlens_q = torch.arange(
+            0,
+            (batch_size + 1) * max_seqlen_q,
+            step=max_seqlen_q,
+            dtype=torch.int32,
+            device=query.device,
+        )
+
+        cu_seqlens_k = torch.arange(
+            0,
+            (batch_size + 1) * max_seqlen_k,
+            step=max_seqlen_k,
+            dtype=torch.int32,
+            device=key.device,
+        )
+
+        # [sq, b, np, hn] -> [b * sq, 1, np, hn]
+        query = query.transpose(0, 1).reshape(
+            output_size[0] * output_size[2], 1, output_size[1], -1
+        )
+
+        # Combined q/k/v into [b * s, 3, np, hn].
+        qkv = torch.concat([query, key, value], dim=1)
+
+        # flash v2
+        output = self.attn(
+            qkv,
+            True,
+            cu_seqlens_q,
+            max_seqlen_q,
+        )
+
+        # [b * sq, np, hn] -> [b, sq, np, hn]
+        matmul_result = output.view(
+            output_size[0], output_size[2], output.shape[1], output.shape[2]
+        )
+        # [b, sq, np, hn] -> [b, np, sq, hn]
+        matmul_result = matmul_result.transpose(1, 2)
+        
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = matmul_result.permute(2, 0, 1, 3).contiguous()
+        
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + (
+            self.hidden_size_per_partition,
+        )        
+    
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+        u = self.out_proj(context_layer)
+        
+        if self.use_cache:
+            u = [output, present]
+        
+        return u
 
 
 class AttentionBlock(nn.Module):
@@ -25,32 +178,50 @@ class AttentionBlock(nn.Module):
         self.pre_norm, self.post_norm = RMSNorm(config), RMSNorm(config)
         self.layer_idx = layer_idx
         self.proj_groups = config.get("proj_groups", 1)
-        dtype = config.get("attn_block_dtype", torch.bfloat16)
-        mlp_dtype = config.get("mlp_dtype", torch.bfloat16)
+        self.dtype = config.get("attn_block_dtype", torch.bfloat16)
+        self.mlp_dtype = config.get("mlp_dtype", torch.bfloat16)
+        self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size_per_attention_head = config.hidden_size // config.num_attention_heads
+        self.use_interpolated_rotary_pos_emb = config.get("use_interpolated_rotary_pos_emb", False)
 
         self.counter = 0
-        self.inner_mha_cls = MHA(
-            embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_heads_kv=config.num_attention_heads // self.proj_groups,
-            rotary_emb_dim=config.hidden_size // config.num_attention_heads,
-            qkv_proj_bias=config.get("qkv_proj_bias", True),
-            rotary_emb_base=config.get("rotary_emb_base", 10000),
-            causal=True,
-            layer_idx=layer_idx,
-            out_proj_bias=config.get("mha_out_proj_bias", True),
-            use_flash_attn=self.config.use_flash_attn,
-        ).to(dtype=dtype)
+        
+        # if we want to use custom pos emb, we need to handle attention manually
+        if self.use_interpolated_rotary_pos_emb:
+            
+            self.inner_mha_cls = CustomSelfAttention(config).to(dtype=self.dtype)
 
-        if self.config.get("smeared_gqa", False):
-            self.inner_mha_cls.num_heads_kv = self.inner_mha_cls.num_heads
-        self.inner_mha_cls.rotary_emb.register_buffer("inv_freq", self.inner_mha_cls.rotary_emb.inv_freq)
+        else:            
+            # FlashAttn handles its own rotary, so we pass None
+            # self.rotary_emb = None
+            
+            self.inner_mha_cls = MHA(
+                embed_dim=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_heads_kv=config.num_attention_heads // self.proj_groups,
+                rotary_emb_dim=config.hidden_size // config.num_attention_heads,
+                qkv_proj_bias=config.get("qkv_proj_bias", True),
+                rotary_emb_base=config.get("rotary_emb_base", 10000),
+                causal=True,
+                layer_idx=layer_idx,
+                out_proj_bias=config.get("mha_out_proj_bias", True),
+                use_flash_attn=self.config.use_flash_attn,
+            ).to(dtype=self.dtype)
 
-        self.mlp = ParallelGatedMLP(config).to(dtype=mlp_dtype)
+            if self.config.get("smeared_gqa", False):
+                self.inner_mha_cls.num_heads_kv = self.inner_mha_cls.num_heads
+                
+            self.inner_mha_cls.rotary_emb.register_buffer("inv_freq", self.inner_mha_cls.rotary_emb.inv_freq)
+
+        self.mlp = ParallelGatedMLP(config).to(dtype=self.mlp_dtype)
+        
+
 
     def forward(self, u, inference_params=None, padding_mask=None, *args, **kwargs):
+        
+        breakpoint()
+        
         if (
             type(padding_mask) == torch.Tensor
         ):  # workaround for masking bug in FA. This works because Wqkv does not have bias
@@ -67,7 +238,8 @@ class AttentionBlock(nn.Module):
         if type(padding_mask) == torch.Tensor:  # guard against bias
             u = u * padding_mask[..., None]
         u = self.mlp(self.post_norm(u)) + u
-        return u, None
+
+        return u, None  # None is for bias
 
 
 class ParallelHyenaFilter(nn.Module):

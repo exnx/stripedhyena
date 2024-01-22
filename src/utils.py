@@ -1,6 +1,9 @@
 import torch
 
 
+def exists(x):
+    return x is not None
+
 def grab_first_if_tuple(x):
     if x.__class__.__name__ == "tuple":
         return x[0]
