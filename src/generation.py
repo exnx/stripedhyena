@@ -129,6 +129,10 @@ class Generator:
 
             if print_generation and verbose:
                 print_rank_0(
+                    f"{new_idx.item()}",
+                    end="-",
+                )
+                print_rank_0(
                     f"{self.tokenizer.detokenize([new_idx.item()])}",
                     end=" ",
                 )
