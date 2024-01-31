@@ -30,6 +30,7 @@ class Generator:
         print_generation=True,
         verbose=False,
         skip_special_tokens=False,
+        skipped_tokens=None,
         stop_at_eos=True,
         max_seqlen=None,
     ):
@@ -51,6 +52,13 @@ class Generator:
         else:
             input = input_ids
         x = input
+
+        if skipped_tokens is not None:
+            if isinstance(skipped_tokens[0], str):
+                skipped_tokens = [
+                    self.tokenizer.tokenize(token) for token in skipped_tokens
+                ]
+            skipped_tokens = torch.LongTensor(skipped_tokens).to(device)
 
         if max_seqlen is not None:
             x = x[:, -max_seqlen:]
@@ -116,6 +124,9 @@ class Generator:
                 )
 
             last_logits = logits[:, -1]
+
+            if skipped_tokens is not None:
+                last_logits[:, skipped_tokens] = float('-inf')
 
             new_idx = sample(
                 last_logits,
