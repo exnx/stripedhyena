@@ -127,7 +127,11 @@ class Generator:
             if stop_at_eos and (generation[0, -2:] == eos_token_ids).all():
                 print_rank_0("Stopping generation at EOS")
 
-            if print_generation and verbose:
+            if print_generation and verbose and batch_size == 1:
+                print_rank_0(
+                    f"{new_idx.item()}",
+                    end="-",
+                )
                 print_rank_0(
                     f"{self.tokenizer.detokenize([new_idx.item()])}",
                     end=" ",
