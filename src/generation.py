@@ -86,6 +86,7 @@ class Generator:
             mem_after_tok = torch.cuda.memory_allocated(device=x.device) / 1e9
             print_rank_0(f"Memory after tokenization: {mem_after_tok} GB")
             print_rank_0("Starting generation...")
+            torch.cuda.memory._record_memory_history(enabled=True)
             if input_string is not None:
                 print_rank_0("Prompt: " + input_string)
             else:
